@@ -12,7 +12,7 @@ def load_data(batchsize:int, numworkers:int) -> tuple[DataLoader, DistributedSam
     data_train = CIFAR10(
                         root = './',
                         train = True,
-                        download = False,
+                        download = True,
                         transform = trans
                     )
     sampler = DistributedSampler(data_train)
