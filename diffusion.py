@@ -4,6 +4,7 @@ import torch.nn as nn
 from tqdm import tqdm
 import torch.nn.functional as F
 from torch.distributed import get_rank
+import ipdb
 
 class GaussianDiffusion(nn.Module):
     def __init__(self, dtype:torch.dtype, model, betas:np.ndarray, w:float, v:float, device:torch.device):
@@ -72,7 +73,7 @@ class GaussianDiffusion(nn.Module):
         neo_shape = torch.ones_like(torch.tensor(x_shape))
         neo_shape[0] = x_shape[0]
         neo_shape = neo_shape.tolist()
-        chosen = coef[t]
+        chosen = coef[t.cpu()]
         chosen = chosen.to(t.device)
         return chosen.reshape(neo_shape)
 

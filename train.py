@@ -14,18 +14,23 @@ from Scheduler import GradualWarmupScheduler
 from dataloader_cifar import load_data, transback
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import get_rank, init_process_group, destroy_process_group, all_gather, get_world_size
+import ipdb
+from cifar import CIFAR10
+import wandb
 
+# TODO: add the captions to the generated images as the sample.py does.
 def train(params:argparse.Namespace):
     assert params.genbatch % (torch.cuda.device_count() * params.clsnum) == 0 , 'please re-set your genbatch!!!'
     # initialize settings
+    wandb.init(project='classifier-free-diffusion-guidance-cifar10n', config=vars(params))
     init_process_group(backend="nccl")
     # get local rank for each process
     local_rank = get_rank()
     # set device
     device = torch.device("cuda", local_rank)
     # load data
-    dataloader, sampler = load_data(params.batchsize, params.numworkers)
-    # initialize models
+    data_train, dataloader, sampler = load_data(params.batchsize, params.numworkers, params.noise_type, params.noise_path, params.is_human)
+
     net = Unet(
                 in_ch = params.inch,
                 mod_ch = params.modch,
@@ -38,6 +43,11 @@ def train(params:argparse.Namespace):
                 dtype = params.dtype
             )
     cemblayer = ConditionalEmbedding(10, params.cdim, params.cdim).to(device)
+    # check the directories defined in the args. 
+    if not os.path.exists(params.moddir):
+        os.makedirs(params.moddir)
+    if not os.path.exists(params.samdir):
+        os.makedirs(params.samdir)
     # load last epoch
     lastpath = os.path.join(params.moddir,'last_epoch.pt')
     if os.path.exists(lastpath):
@@ -104,13 +114,13 @@ def train(params:argparse.Namespace):
         sampler.set_epoch(epc)
         # batch iterations
         with tqdm(dataloader, dynamic_ncols=True, disable=(local_rank % cnt != 0)) as tqdmDataLoader:
-            for img, lab in tqdmDataLoader:
+            for i, (img, lab, _) in enumerate(tqdmDataLoader):
                 b = img.shape[0]
                 optimizer.zero_grad()
                 x_0 = img.to(device)
-                lab = lab.to(device)
-                cemb = cemblayer(lab)
-                cemb[np.where(np.random.rand(b)<params.threshold)] = 0
+                lab = [lab_noisy.to(device) for lab_noisy in lab] # this is a list.
+                cemb = cemblayer(lab) # conditional embedding.
+                cemb[np.where(np.random.rand(b)<params.threshold)] = 0 # why?
                 loss = diffusion.trainloss(x_0, cemb = cemb)
                 loss.backward()
                 optimizer.step()
@@ -123,6 +133,11 @@ def train(params:argparse.Namespace):
                         "LR": optimizer.state_dict()['param_groups'][0]["lr"]
                     }
                 )
+                wandb.log({
+                    'epoch': epc + 1,
+                    'loss': loss.item(),
+                    'lr': optimizer.state_dict()['param_groups'][0]["lr"]
+                })
         warmUpScheduler.step()
         # evaluation and save checkpoint
         if (epc + 1) % params.interval == 0:
@@ -134,10 +149,9 @@ def train(params:argparse.Namespace):
             all_samples = []
             each_device_batch = params.genbatch // cnt
             with torch.no_grad():
-                lab = torch.ones(params.clsnum, each_device_batch // params.clsnum).type(torch.long) \
-                * torch.arange(start = 0, end = params.clsnum).reshape(-1, 1)
-                lab = lab.reshape(-1, 1).squeeze()
-                lab = lab.to(device)
+                lab = data_train.train_noisy_labels_diff[:each_device_batch]
+                lab = torch.tensor(lab).to(device)
+                lab = lab.transpose(0, 1) # the lab should be [3 * each_device_batch] instead of [each_device_batch * 3]
                 cemb = cemblayer(lab)
                 genshape = (each_device_batch , 3, 32, 32)
                 if params.ddim:
@@ -151,7 +165,10 @@ def train(params:argparse.Namespace):
                 all_samples.extend([img for img in gathered_samples])
                 samples = torch.concat(all_samples, dim = 1).reshape(params.genbatch, 3, 32, 32)
                 if local_rank == 0:
-                    save_image(samples, os.path.join(params.samdir, f'generated_{epc+1}_pict.png'), nrow = params.genbatch // params.clsnum)
+                    # captions = [str(label.item()) for label in lab]
+                    captions = [f"{label[0].item()}, {label[1].item()}, {label[2].item()}" for label in lab.transpose(0, 1)]
+                    save_image(samples, os.path.join(params.samdir, f'generated_{epc+1}_pict.png'), nrow = params.genbatch // params.clsnum, caption = captions)
+                    wandb.log({'generated': [wandb.Image(os.path.join(params.samdir, f'generated_{epc+1}_pict.png'))]})
             # save checkpoints
             checkpoint = {
                                 'net':diffusion.model.module.state_dict(),
@@ -168,15 +185,15 @@ def main():
     # several hyperparameters for model
     parser = argparse.ArgumentParser(description='test for diffusion model')
 
-    parser.add_argument('--batchsize',type=int,default=256,help='batch size per device for training Unet model')
-    parser.add_argument('--numworkers',type=int,default=4,help='num workers for training Unet model')
+    parser.add_argument('--batchsize',type=int,default=512,help='batch size per device for training Unet model')
+    parser.add_argument('--numworkers',type=int,default=5,help='num workers for training Unet model')
     parser.add_argument('--inch',type=int,default=3,help='input channels for Unet model')
     parser.add_argument('--modch',type=int,default=64,help='model channels for Unet model')
     parser.add_argument('--T',type=int,default=1000,help='timesteps for Unet model')
     parser.add_argument('--outch',type=int,default=3,help='output channels for Unet model')
     parser.add_argument('--chmul',type=list,default=[1,2,2,2],help='architecture parameters training Unet model')
     parser.add_argument('--numres',type=int,default=2,help='number of resblocks for each block in Unet model')
-    parser.add_argument('--cdim',type=int,default=10,help='dimension of conditional embedding')
+    parser.add_argument('--cdim',type=int,default=10,help='dimension of conditional embedding')  # convert to 10.
     parser.add_argument('--useconv',type=bool,default=True,help='whether use convlution in downsample')
     parser.add_argument('--droprate',type=float,default=0.1,help='dropout rate for model')
     parser.add_argument('--dtype',default=torch.float32)
@@ -186,16 +203,24 @@ def main():
     parser.add_argument('--epoch',type=int,default=1500,help='epochs for training')
     parser.add_argument('--multiplier',type=float,default=2.5,help='multiplier for warmup')
     parser.add_argument('--threshold',type=float,default=0.1,help='threshold for classifier-free guidance')
-    parser.add_argument('--interval',type=int,default=20,help='epoch interval between two evaluations')
-    parser.add_argument('--moddir',type=str,default='model',help='model addresses')
-    parser.add_argument('--samdir',type=str,default='sample',help='sample addresses')
-    parser.add_argument('--genbatch',type=int,default=80,help='batch size for sampling process')
+    parser.add_argument('--interval',type=int,default=30,help='epoch interval between two evaluations')
+    parser.add_argument('--moddir',type=str,default='model_cifar10n',help='model addresses')
+    parser.add_argument('--samdir',type=str,default='sample_cifar10n',help='sample addresses')
+    parser.add_argument('--genbatch',type=int,default=500,help='batch size for sampling process')
     parser.add_argument('--clsnum',type=int,default=10,help='num of label classes')
     parser.add_argument('--num_steps',type=int,default=50,help='sampling steps for DDIM')
     parser.add_argument('--eta',type=float,default=0,help='eta for variance during DDIM sampling process')
     parser.add_argument('--select',type=str,default='linear',help='selection stragies for DDIM')
-    parser.add_argument('--ddim',type=lambda x:(str(x).lower() in ['true','1', 'yes']),default=False,help='whether to use ddim')
+    parser.add_argument('--ddim',type=lambda x:(str(x).lower() in ['true','1', 'yes']),default=True,help='whether to use ddim')
     parser.add_argument('--local_rank',default=-1,type=int,help='node rank for distributed training')
+
+    # Cifar10 setting.
+    parser.add_argument('--noise_type', type=str, choices='[clean_label, aggre_label, worse_label, random_label1, random_label2, random_label3, multi_rater]', 
+                        default='multi_rater', help='type of noise')
+    parser.add_argument('--noise_path', type=str, 
+                        default='/home/wenjie/projects/classifier-free-diffusion-guidance-Pytorch/cifar-10-batches-py/CIFAR-10_human.pt', 
+                        help='path to noise file')
+    parser.add_argument('--is_human', type=lambda x:(str(x).lower() in ['true','1', 'yes']), default=True, help='whether to use human noise')
     
     args = parser.parse_args()
     train(args)
